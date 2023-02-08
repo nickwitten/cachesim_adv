@@ -14,6 +14,21 @@ void legalize_s(sim_config_t *config) {
 
 }
 
+
+struct tag {
+    char dirty;
+    char valid;
+    uint64_t addr;
+};
+
+struct set {
+    struct tag **tags;
+};
+
+struct tag_store {
+    struct set **sets;
+};
+
 /**
  * Subroutine for initializing the cache simulator. You many add and initialize any global or heap
  * variables as needed.
@@ -21,7 +36,8 @@ void legalize_s(sim_config_t *config) {
  */
 
 void sim_setup(sim_config_t *config) {
-    
+    // calculate the size of the tag store
+    // allocate the tag store
 }
 
 /**
