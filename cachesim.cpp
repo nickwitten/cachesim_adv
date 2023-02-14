@@ -1,4 +1,5 @@
 #include "cachesim.hpp"
+#include <stdlib.h>
 
 /**
  * The use of virtually indexed physically tagged caches limits 
@@ -18,16 +19,22 @@ void legalize_s(sim_config_t *config) {
 struct tag {
     char dirty;
     char valid;
-    uint64_t addr;
+    uint64_t value;
+    struct tag *next;
 };
 
 struct set {
-    struct tag **tags;
+    struct tag *mru;
 };
+int num_ways;
 
 struct tag_store {
     struct set **sets;
-};
+} tag_store;
+
+uint64_t index_mask;
+uint64_t tag_mask;
+uint64_t offset_mask;
 
 /**
  * Subroutine for initializing the cache simulator. You many add and initialize any global or heap
@@ -37,7 +44,13 @@ struct tag_store {
 
 void sim_setup(sim_config_t *config) {
     // calculate the size of the tag store
-    // allocate the tag store
+    num_ways = 1 << config->s;
+    int num_sets = 1 << (config->c - (config->b + config->s));  // cache size in bytes divided by (block size in bytes times blocks per set)
+    tag_store.sets = (struct set**)calloc(num_sets, sizeof(struct set));  // Allocate a block of memory to store all of the sets
+    // create address masks
+    offset_mask = (1 << config->b) - 1;
+    index_mask = ((1 << (config->c - config->s)) - 1) & ~offset_mask;
+    tag_mask = ~0 & (offset_mask | index_mask);
 }
 
 /**
@@ -45,7 +58,48 @@ void sim_setup(sim_config_t *config) {
  * TODO: You're responsible for completing this routine
  */
 void sim_access(char rw, uint64_t addr, sim_stats_t* stats) {
+    uint64_t index = addr & index_mask;
+    uint64_t tag = addr & tag_mask;
+    struct set *active_set = tag_store.sets[index];
+    struct tag *active_way = active_set->mru;
+    struct tag *prev_way = 0;
+    int hit_flag = 0;
+    while (active_way != 0) {
+        if (tag == active_way->value) {
+            // HIT!!
+            hit_flag = 1;
+            // Move to MRU position
+            if (prev_way != 0) {
+                prev_way->next = active_way->next;
+                active_way->next = active_set->mru;
+                active_set->mru = active_way;
+            }
+            break;
+        }
+        prev_way = active_way;
+        active_way = active_way->next;
+    }
 
+    if (!hit_flag) {
+        // Allocate a new tag
+        struct tag *active_way = (struct tag *)calloc(1, sizeof(struct tag));
+        active_way->value = tag;
+        active_way->valid = 1;
+    }
+    if (rw == 'W') {
+        active_way->dirty = 1;
+    }
+
+    // Purge the LRU if the set is too large
+    active_way = active_set->mru;
+    int i = 1;
+    while (active_way != 0) {
+        if (i == num_ways) {
+            active_way->next = 0;
+        }
+        active_way = active_way->next;
+        i++;
+    }
 }
 
 /**
@@ -54,5 +108,4 @@ void sim_access(char rw, uint64_t addr, sim_stats_t* stats) {
  * TODO: You're responsible for completing this routine
  */
 void sim_finish(sim_stats_t *stats) {
-    
 }
