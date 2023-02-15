@@ -59,6 +59,7 @@ int num_pages;
 int num_tlb_entries;
 bool vipt;
 int s;
+int m;
 uint64_t index_mask;
 uint64_t index_position;
 uint64_t tag_mask;
@@ -86,7 +87,7 @@ struct translation *initialize_translation_storage(struct translation_storage *s
 struct translation *search_for_translation(struct translation_storage *store, uint64_t vpn) {
     struct translation *mapping = store->mru;
     while (mapping != 0) {
-        if (mapping->vpn == vpn) {
+        if (mapping->vpn == vpn && mapping->valid) {
             return mapping;
         }
         mapping = mapping->next;
@@ -99,14 +100,19 @@ void update_translation_mru(struct translation_storage *store, struct translatio
         return;
     }
     if (mapping->prev == 0) {
-        return;  // Already in the MRU position
+        // Already in the MRU position
+        return;
     }
     // Remove from current position
     mapping->prev->next = mapping->next;
-    if (mapping->next != 0) {
+    if (mapping->next == 0) {
+        // Was at the LRU position
+        store->lru = mapping->prev;
+    } else {
         mapping->next->prev = mapping->prev;
     }
     // Place at mru
+    store->mru->prev = mapping;
     mapping->next = store->mru;
     mapping->prev = 0;
     store->mru = mapping;
@@ -119,24 +125,21 @@ void insert_translation(struct translation_storage *store, int64_t vpn, int64_t 
     victim->vpn = vpn;
     victim->pfn = pfn;
     victim->parent = parent;
-    if (victim->prev != 0) {
-        store->lru = victim->prev;
-    }
     update_translation_mru(store, victim);
 }
 
 int64_t search_tlb(uint64_t addr) {
     int64_t vpn = (addr & vpn_mask) >> vpn_position;
     int64_t pfn = -1;
-    struct translation *mapping = search_for_translation(&tlb, vpn);
-    if (mapping == 0) {
+    struct translation *tlb_mapping = search_for_translation(&tlb, vpn);
+    if (tlb_mapping == 0) {
         // Translation wasn't found
         return -1;
     }
-    pfn = mapping->pfn;
+    pfn = tlb_mapping->pfn;
     // Update lru stack in both tlb and hwivpt
-    update_translation_mru(&tlb, mapping);
-    update_translation_mru(&hwivpt, mapping->parent);
+    update_translation_mru(&tlb, tlb_mapping);
+    update_translation_mru(&hwivpt, tlb_mapping->parent);
     return pfn;
 }
 
@@ -192,6 +195,7 @@ void flush_cache(sim_stats_t *stats) {
 void sim_setup(sim_config_t *config) {
     // calculate the size of the tag store
     s = config->s;
+    m = config->m;
     num_ways = 1 << config->s;
     // cache size in bytes divided by (block size in bytes times blocks per set)
     num_sets = 1 << (config->c - (config->b + config->s));
@@ -231,7 +235,6 @@ void sim_setup(sim_config_t *config) {
 void sim_access(char rw, uint64_t addr, sim_stats_t* stats) {
     stats->accesses_l1++;
     uint64_t index = (addr & index_mask) >> index_position;
-    uint64_t tag = (addr & tag_mask) >> tag_position;
     stats->array_lookups_l1++;
     struct set *active_set = tag_store.sets[index];
     struct tag *active_way;
@@ -249,6 +252,7 @@ void sim_access(char rw, uint64_t addr, sim_stats_t* stats) {
         }
     }
 
+    uint64_t tag = (addr & tag_mask) >> tag_position;
     int hit_flag = 0;
     if (!vipt || pfn >= 0) {
         active_way = active_set->mru;
@@ -333,9 +337,23 @@ void sim_access(char rw, uint64_t addr, sim_stats_t* stats) {
 void sim_finish(sim_stats_t *stats) {
     stats->hit_ratio_l1 = (double)stats->hits_l1 / stats->accesses_l1;
     stats->miss_ratio_l1 = (double)stats->misses_l1 / stats->accesses_l1;
-    double hit_time = (L1_ARRAY_LOOKUP_TIME_CONST +
-        L1_TAG_COMPARE_TIME_CONST + s * L1_TAG_COMPARE_TIME_PER_S);
-    stats->avg_access_time = hit_time + stats->miss_ratio_l1 * DRAM_ACCESS_PENALTY;
+    double tag_compare_time = L1_TAG_COMPARE_TIME_CONST + s * L1_TAG_COMPARE_TIME_PER_S;
+    double hit_time = L1_ARRAY_LOOKUP_TIME_CONST + tag_compare_time;
+    double miss_penalty = DRAM_ACCESS_PENALTY;
+
+    if (vipt) {
+        stats->hit_ratio_tlb = (double)stats->hits_tlb / stats->accesses_tlb;
+        stats->miss_ratio_tlb = (double)stats->misses_tlb / stats->accesses_tlb;
+        stats->hit_ratio_hw_ivpt = (double)stats->hits_hw_ivpt / stats->accesses_hw_ivpt;
+        stats->miss_ratio_hw_ivpt = (double)stats->misses_hw_ivpt / stats->accesses_hw_ivpt;
+        double hwivpt_penalty = (1 + HW_IVPT_ACCESS_TIME_PER_M * m) * DRAM_ACCESS_PENALTY;
+        hit_time = (L1_ARRAY_LOOKUP_TIME_CONST +
+            stats->hit_ratio_tlb * tag_compare_time +
+            stats->miss_ratio_tlb * (hwivpt_penalty + tag_compare_time * stats->hit_ratio_hw_ivpt));
+    }
+
+    stats->avg_access_time = hit_time + stats->miss_ratio_l1 * miss_penalty;
+
     // Free the tag store
     flush_cache(0);
     for (int i = 0; i < num_sets; i++) {
