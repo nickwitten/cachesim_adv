@@ -70,6 +70,44 @@ uint64_t vpn_mask;
 uint64_t vpn_position;
 
 
+void configure_user_setup(sim_config_t *config) {
+    s = config->s;
+    m = config->m;
+    num_ways = 1 << config->s;
+    // cache size in bytes divided by (block size in bytes times blocks per set)
+    num_sets = 1 << (config->c - (config->b + config->s));
+    if (config->vipt) {
+        vipt = true;
+        num_pages = 1 << config->m;
+        num_tlb_entries = 1 << config->t;
+    }
+}
+
+void allocate_l1(void) {
+    // Allocate a block of memory to store all of the sets
+    tag_store.sets = (struct set**)calloc(num_sets, sizeof(struct set*));
+    // allocate sets and store pointers in the array of sets
+    for (int i = 0; i < num_sets; i++) {
+        tag_store.sets[i] = (struct set*)calloc(1, sizeof(struct set));
+    }
+}
+
+void configure_bit_tools(sim_config_t *config) {
+    // create address masks and positions
+    offset_position = 0;
+    offset_mask = (1 << config->b) - 1;
+
+    index_position = config->b;
+    index_mask = ((1 << (config->c - config->s)) - 1) & ~offset_mask;
+
+    tag_position = config->c - config->s;
+    tag_mask = ~0 & ~(offset_mask | index_mask);
+    if (vipt) {
+        vpn_mask = ~((1 << config->p) - 1);
+        vpn_position = config->p;
+    }
+}
+
 struct translation *initialize_translation_storage(struct translation_storage *store, uint64_t size) {
         // unlike cache, allocate all tlb and hwivpt entries
         struct translation *translations_base = (struct translation *)calloc(size, sizeof(struct translation));
@@ -82,6 +120,71 @@ struct translation *initialize_translation_storage(struct translation_storage *s
         store->lru = &(translations_base[size - 1]);
         store->lru->pfn = size - 1;
         return translations_base;
+}
+
+struct tag *search_and_pop_set(struct set *set, uint64_t tag, sim_stats_t *stats) {
+    struct tag *active_way = set->mru;
+    struct tag *prev_way = 0;
+    stats->tag_compares_l1 += num_ways;
+    int hit_flag = 0;
+    while (active_way != 0) {
+        if (tag == active_way->value) {
+            // HIT!!
+            stats->hits_l1++;
+            hit_flag = 1;
+            // Remove from current position
+            if (prev_way == 0) {
+                // Hit on MRU
+                set->mru = active_way->next;
+            } else {
+                prev_way->next = active_way->next;
+            }
+            break;
+        }
+        prev_way = active_way;
+        active_way = active_way->next;
+    }
+    if (!hit_flag) {
+        return 0;
+    }
+    return active_way;
+}
+
+void update_set_mru(struct set *set, struct tag *tag, sim_stats_t *stats) {
+    tag->next = set->mru;
+    set->mru = tag;
+    // Purge the LRU if the set is too large
+    struct tag *active_way = set->mru;
+    int i = 1;
+    while (active_way != 0) {
+        if (i == num_ways) {
+            struct tag *victim_tag = active_way->next;
+            if (victim_tag != 0) {
+                stats->writebacks_l1 += (victim_tag->dirty) ? 1 : 0;
+                free(victim_tag);
+                active_way->next = 0;
+            }
+        }
+        active_way = active_way->next;
+        i++;
+    }
+}
+
+void flush_cache(sim_stats_t *stats) {
+    for (int i = 0; i < num_sets; i++) {
+        struct tag *active_way = tag_store.sets[i]->mru;
+        while (active_way != 0) {
+            if (stats) {
+                if (active_way->dirty) {
+                    stats->cache_flush_writebacks++;
+                }
+            }
+            struct tag *next = active_way->next;
+            free(active_way);
+            active_way = next;
+        }
+        tag_store.sets[i]->mru = 0;
+    }
 }
 
 struct translation *search_for_translation(struct translation_storage *store, uint64_t vpn) {
@@ -117,7 +220,6 @@ void update_translation_mru(struct translation_storage *store, struct translatio
     mapping->prev = 0;
     store->mru = mapping;
 }
-
 
 void insert_translation(struct translation_storage *store, int64_t vpn, int64_t pfn, struct translation *parent) {
     struct translation *victim = store->lru;
@@ -167,69 +269,12 @@ int64_t page_fault_handler(uint64_t addr) {
     return pfn;
 }
 
-void flush_cache(sim_stats_t *stats) {
-    for (int i = 0; i < num_sets; i++) {
-        struct tag *active_way = tag_store.sets[i]->mru;
-        while (active_way != 0) {
-            if (stats) {
-                if (active_way->dirty) {
-                    stats->cache_flush_writebacks++;
-                }
-            }
-            struct tag *next = active_way->next;
-            free(active_way);
-            active_way = next;
-        }
-        tag_store.sets[i]->mru = 0;
-    }
-}
-
-void configure_user_setup(sim_config_t *config) {
-    s = config->s;
-    m = config->m;
-    num_ways = 1 << config->s;
-    // cache size in bytes divided by (block size in bytes times blocks per set)
-    num_sets = 1 << (config->c - (config->b + config->s));
-    if (config->vipt) {
-        vipt = true;
-        num_pages = 1 << config->m;
-        num_tlb_entries = 1 << config->t;
-    }
-}
-
-void allocate_l1(void) {
-    // Allocate a block of memory to store all of the sets
-    tag_store.sets = (struct set**)calloc(num_sets, sizeof(struct set*));
-    // allocate sets and store pointers in the array of sets
-    for (int i = 0; i < num_sets; i++) {
-        tag_store.sets[i] = (struct set*)calloc(1, sizeof(struct set));
-    }
-}
-
-void configure_bit_tools(sim_config_t *config) {
-    // create address masks and positions
-    offset_position = 0;
-    offset_mask = (1 << config->b) - 1;
-
-    index_position = config->b;
-    index_mask = ((1 << (config->c - config->s)) - 1) & ~offset_mask;
-
-    tag_position = config->c - config->s;
-    tag_mask = ~0 & ~(offset_mask | index_mask);
-    if (vipt) {
-        vpn_mask = ~((1 << config->p) - 1);
-        vpn_position = config->p;
-    }
-}
-
-
 
 /**
  * Subroutine for initializing the cache simulator. You many add and initialize any global or heap
  * variables as needed.
  * TODO: You're responsible for completing this routine
  */
-
 void sim_setup(sim_config_t *config) {
     configure_user_setup(config);
     allocate_l1();
@@ -250,7 +295,6 @@ void sim_access(char rw, uint64_t addr, sim_stats_t* stats) {
     uint64_t index = (addr & index_mask) >> index_position;
     stats->array_lookups_l1++;
     struct set *active_set = tag_store.sets[index];
-    struct tag *active_way;
     int64_t pfn = -1;
 
     if (vipt) {
@@ -275,32 +319,14 @@ void sim_access(char rw, uint64_t addr, sim_stats_t* stats) {
         }
     }
 
-    int hit_flag = 0;
     uint64_t tag = (addr & tag_mask) >> tag_position;
+    struct tag *active_way = 0;
     if (!vipt || pfn >= 0) {
-        active_way = active_set->mru;
-        struct tag *prev_way = 0;
-        stats->tag_compares_l1 += num_ways;
-        while (active_way != 0) {
-            if (tag == active_way->value) {
-                // HIT!!
-                stats->hits_l1++;
-                hit_flag = 1;
-                // Remove from current position
-                if (prev_way == 0) {
-                    // Hit on MRU
-                    active_set->mru = active_way->next;
-                } else {
-                    prev_way->next = active_way->next;
-                }
-                break;
-            }
-            prev_way = active_way;
-            active_way = active_way->next;
-        }
-        if (!hit_flag) {
-            stats->misses_l1++;
-        }
+        active_way = search_and_pop_set(active_set, tag, stats);
+    }
+
+    if (active_way == 0) {
+        stats->misses_l1++;
     }
 
     if (vipt && pfn < 0) {
@@ -309,10 +335,9 @@ void sim_access(char rw, uint64_t addr, sim_stats_t* stats) {
         pfn = page_fault_handler(addr);
         addr = (pfn << vpn_position) | (addr & ~vpn_mask);
         tag = (addr & tag_mask) >> tag_position;
-        stats->misses_l1++;
     }
 
-    if (!hit_flag) {
+    if (active_way == 0) {
         // Allocate a new tag
         active_way = (struct tag *)calloc(1, sizeof(struct tag));
         active_way->value = tag;
@@ -326,24 +351,7 @@ void sim_access(char rw, uint64_t addr, sim_stats_t* stats) {
     }
 
     // Move to MRU position
-    active_way->next = active_set->mru;
-    active_set->mru = active_way;
-
-    // Purge the LRU if the set is too large
-    active_way = active_set->mru;
-    int i = 1;
-    while (active_way != 0) {
-        if (i == num_ways) {
-            struct tag *victim_tag = active_way->next;
-            if (victim_tag != 0) {
-                stats->writebacks_l1 += (victim_tag->dirty) ? 1 : 0;
-                free(victim_tag);
-                active_way->next = 0;
-            }
-        }
-        active_way = active_way->next;
-        i++;
-    }
+    update_set_mru(active_set, active_way, stats);
 }
 
 /**
