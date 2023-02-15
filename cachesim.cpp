@@ -2,22 +2,8 @@
 #include <stdlib.h>
 #include <stdio.h>
 
-/**
- * The use of virtually indexed physically tagged caches limits 
- *      the total number of sets you can have.
- * If the user selected configuration is invalid for VIPT
- *      Update config->s to reflect the minimum value for S (log2 number of ways)
- * If the user selected configuration is valid
- *      do not modify it.
- * TODO: You're responsible for completing this routine
-*/
 
-void legalize_s(sim_config_t *config) {
-    if (config->c - config->s > config->p) {
-        config->s = config->c - config->p;
-    }
-}
-
+/************** Structure Definitions **************/
 
 // Valid bit is not included because the allocation of this structure indicates
 // the corresponding block is in the cache
@@ -36,14 +22,14 @@ struct translation {
     // Parent is corresponding translation in hwivpt for tlb, not used by hwivpt
     struct translation *parent;
 };
+// All of the translations will be allocated in a block at these locations
+struct translation *tlb_translations;
+struct translation *hwivpt_translations;
 
 struct translation_storage {
     struct translation *mru;
     struct translation *lru;
 } tlb, hwivpt;
-// All of the translations will be allocated in a block at these locations
-struct translation *tlb_translations;
-struct translation *hwivpt_translations;
 
 struct set {
     struct tag *mru;
@@ -52,6 +38,8 @@ struct set {
 struct tag_store {
     struct set **sets;
 } tag_store;
+
+/************** Global Variables **************/
 
 int num_ways;
 int num_sets;
@@ -69,7 +57,11 @@ uint64_t offset_position;
 uint64_t vpn_mask;
 uint64_t vpn_position;
 
+/************** Setup Functions **************/
 
+/**
+ * Calculations based on the cache, tlb, and hwivpt configurations
+ */
 void configure_user_setup(sim_config_t *config) {
     s = config->s;
     m = config->m;
@@ -83,6 +75,9 @@ void configure_user_setup(sim_config_t *config) {
     }
 }
 
+/**
+ * Request dynamic memory for the level 1 cache
+ */
 void allocate_l1(void) {
     // Allocate a block of memory to store all of the sets
     tag_store.sets = (struct set**)calloc(num_sets, sizeof(struct set*));
@@ -92,6 +87,9 @@ void allocate_l1(void) {
     }
 }
 
+/**
+ * Create bit masks and positions for easy address manipulations
+ */
 void configure_bit_tools(sim_config_t *config) {
     // create address masks and positions
     offset_position = 0;
@@ -108,20 +106,28 @@ void configure_bit_tools(sim_config_t *config) {
     }
 }
 
+/**
+ * Request dynamic memory for the either the TLB or the HWIVPT
+ */
 struct translation *initialize_translation_storage(struct translation_storage *store, uint64_t size) {
-        // unlike cache, allocate all tlb and hwivpt entries
-        struct translation *translations_base = (struct translation *)calloc(size, sizeof(struct translation));
-        for (uint64_t i = 0; i < (size - 1); i++) {
-            translations_base[i].pfn = i;
-            translations_base[i].next = &(translations_base[i + 1]);
-            translations_base[i + 1].prev = &(translations_base[i]);
-        }
-        store->mru = translations_base;
-        store->lru = &(translations_base[size - 1]);
-        store->lru->pfn = size - 1;
-        return translations_base;
+    // unlike cache, allocate all tlb and hwivpt entries
+    struct translation *translations_base = (struct translation *)calloc(size, sizeof(struct translation));
+    for (uint64_t i = 0; i < (size - 1); i++) {
+        translations_base[i].pfn = i;
+        translations_base[i].next = &(translations_base[i + 1]);
+        translations_base[i + 1].prev = &(translations_base[i]);
+    }
+    store->mru = translations_base;
+    store->lru = &(translations_base[size - 1]);
+    store->lru->pfn = size - 1;
+    return translations_base;
 }
 
+/************** L1 Cache Helper Functions **************/
+
+/**
+ * Search for a specific tag within a set and pop it off the LRU stack
+ */
 struct tag *search_and_pop_set(struct set *set, uint64_t tag, sim_stats_t *stats) {
     struct tag *active_way = set->mru;
     struct tag *prev_way = 0;
@@ -150,6 +156,9 @@ struct tag *search_and_pop_set(struct set *set, uint64_t tag, sim_stats_t *stats
     return active_way;
 }
 
+/**
+ * Update the MRU of a set based on a recent access, this may evict LRU
+ */
 void update_set_mru(struct set *set, struct tag *tag, sim_stats_t *stats) {
     tag->next = set->mru;
     set->mru = tag;
@@ -170,6 +179,9 @@ void update_set_mru(struct set *set, struct tag *tag, sim_stats_t *stats) {
     }
 }
 
+/**
+ * Flush all of the L1 cache
+ */
 void flush_cache(sim_stats_t *stats) {
     for (int i = 0; i < num_sets; i++) {
         struct tag *active_way = tag_store.sets[i]->mru;
@@ -187,6 +199,11 @@ void flush_cache(sim_stats_t *stats) {
     }
 }
 
+/************** Virtual Address Translation Helper Functions **************/
+
+/**
+ * Search for a virtual page number in either the TLB or HWIVPT
+ */
 struct translation *search_for_translation(struct translation_storage *store, uint64_t vpn) {
     struct translation *mapping = store->mru;
     while (mapping != 0) {
@@ -198,6 +215,9 @@ struct translation *search_for_translation(struct translation_storage *store, ui
     return 0;
 }
 
+/**
+ * Update the MRU in either the TLB or HWIVPT based on a recent access
+ */
 void update_translation_mru(struct translation_storage *store, struct translation *mapping) {
     if (mapping == 0) {
         return;
@@ -221,6 +241,9 @@ void update_translation_mru(struct translation_storage *store, struct translatio
     store->mru = mapping;
 }
 
+/**
+ * Insert a translation in either the TLB or HWIVPT using the LRU frame
+ */
 void insert_translation(struct translation_storage *store, int64_t vpn, int64_t pfn, struct translation *parent) {
     struct translation *victim = store->lru;
     victim->valid = 1;
@@ -230,6 +253,9 @@ void insert_translation(struct translation_storage *store, int64_t vpn, int64_t 
     update_translation_mru(store, victim);
 }
 
+/**
+ * Look for a translation in the TLB, return -1 if not found
+ */
 int64_t search_tlb(uint64_t addr) {
     int64_t vpn = (addr & vpn_mask) >> vpn_position;
     int64_t pfn = -1;
@@ -245,6 +271,9 @@ int64_t search_tlb(uint64_t addr) {
     return pfn;
 }
 
+/**
+ * Look for a translation in the HWIVPT, return -1 if not found
+ */
 int64_t search_hwivpt(uint64_t addr) {
     int64_t vpn = (addr & vpn_mask) >> vpn_position;
     int64_t pfn = -1;
@@ -261,6 +290,10 @@ int64_t search_hwivpt(uint64_t addr) {
     return pfn;
 }
 
+/**
+ * Handle a page fault by evicting the LRU frame and inserting new entries in
+ * the TLB and HWIVPT
+ */
 int64_t page_fault_handler(uint64_t addr) {
     int64_t vpn = (addr & vpn_mask) >> vpn_position;
     insert_translation(&hwivpt, vpn, hwivpt.lru->pfn, 0);
@@ -269,11 +302,23 @@ int64_t page_fault_handler(uint64_t addr) {
     return pfn;
 }
 
+/**
+ * The use of virtually indexed physically tagged caches limits 
+ *      the total number of sets you can have.
+ * If the user selected configuration is invalid for VIPT
+ *      Update config->s to reflect the minimum value for S (log2 number of ways)
+ * If the user selected configuration is valid
+ *      do not modify it.
+*/
+void legalize_s(sim_config_t *config) {
+    if (config->c - config->s > config->p) {
+        config->s = config->c - config->p;
+    }
+}
 
 /**
  * Subroutine for initializing the cache simulator. You many add and initialize any global or heap
  * variables as needed.
- * TODO: You're responsible for completing this routine
  */
 void sim_setup(sim_config_t *config) {
     configure_user_setup(config);
@@ -285,10 +330,8 @@ void sim_setup(sim_config_t *config) {
     }
 }
 
-
 /**
  * Subroutine that simulates the cache one trace event at a time.
- * TODO: You're responsible for completing this routine
  */
 void sim_access(char rw, uint64_t addr, sim_stats_t* stats) {
     stats->accesses_l1++;
@@ -357,7 +400,6 @@ void sim_access(char rw, uint64_t addr, sim_stats_t* stats) {
 /**
  * Subroutine for cleaning up any outstanding memory operations and calculating overall statistics
  * such as miss rate or average access time.
- * TODO: You're responsible for completing this routine
  */
 void sim_finish(sim_stats_t *stats) {
     stats->hit_ratio_l1 = (double)stats->hits_l1 / stats->accesses_l1;
