@@ -246,14 +246,24 @@ void sim_access(char rw, uint64_t addr, sim_stats_t* stats) {
         if (pfn < 0) {
             // Translation not in TLB
             stats->misses_tlb++;
+
+            stats->accesses_hw_ivpt++;
+            pfn = search_hwivpt(addr);
+            if (pfn < 0) {
+                stats->misses_hw_ivpt++;
+            } else {
+                stats->hits_hw_ivpt++;
+                addr = (pfn << vpn_position) | (addr & ~vpn_mask);
+            }
+
         } else {
             stats->hits_tlb++;
             addr = (pfn << vpn_position) | (addr & ~vpn_mask);
         }
     }
 
-    uint64_t tag = (addr & tag_mask) >> tag_position;
     int hit_flag = 0;
+    uint64_t tag = (addr & tag_mask) >> tag_position;
     if (!vipt || pfn >= 0) {
         active_way = active_set->mru;
         struct tag *prev_way = 0;
@@ -281,18 +291,12 @@ void sim_access(char rw, uint64_t addr, sim_stats_t* stats) {
     }
 
     if (vipt && pfn < 0) {
-        stats->accesses_hw_ivpt++;
-        pfn = search_hwivpt(addr);
-        if (pfn < 0) {
-            // Page fault!!
-            stats->misses_hw_ivpt++;
-            flush_cache(stats);
-            pfn = page_fault_handler(addr);
-        } else {
-            stats->hits_hw_ivpt++;
-        }
+        // Page fault!!
+        flush_cache(stats);
+        pfn = page_fault_handler(addr);
         addr = (pfn << vpn_position) | (addr & ~vpn_mask);
         tag = (addr & tag_mask) >> tag_position;
+        stats->misses_l1++;
     }
 
     if (!hit_flag) {
