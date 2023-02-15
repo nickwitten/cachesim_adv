@@ -384,6 +384,8 @@ void sim_finish(sim_stats_t *stats) {
     for (int i = 0; i < num_sets; i++) {
         free(tag_store.sets[i]);
     }
+    free(tag_store.sets);
+
     if (vipt) {
         // Free the virtual address translations
         free(tlb_translations);
