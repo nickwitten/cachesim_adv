@@ -184,27 +184,29 @@ void flush_cache(sim_stats_t *stats) {
     }
 }
 
-
-
-/**
- * Subroutine for initializing the cache simulator. You many add and initialize any global or heap
- * variables as needed.
- * TODO: You're responsible for completing this routine
- */
-
-void sim_setup(sim_config_t *config) {
-    // calculate the size of the tag store
+void configure_user_setup(sim_config_t *config) {
     s = config->s;
     m = config->m;
     num_ways = 1 << config->s;
     // cache size in bytes divided by (block size in bytes times blocks per set)
     num_sets = 1 << (config->c - (config->b + config->s));
+    if (config->vipt) {
+        vipt = true;
+        num_pages = 1 << config->m;
+        num_tlb_entries = 1 << config->t;
+    }
+}
+
+void allocate_l1(void) {
     // Allocate a block of memory to store all of the sets
     tag_store.sets = (struct set**)calloc(num_sets, sizeof(struct set*));
     // allocate sets and store pointers in the array of sets
     for (int i = 0; i < num_sets; i++) {
         tag_store.sets[i] = (struct set*)calloc(1, sizeof(struct set));
     }
+}
+
+void configure_bit_tools(sim_config_t *config) {
     // create address masks and positions
     offset_position = 0;
     offset_mask = (1 << config->b) - 1;
@@ -214,16 +216,27 @@ void sim_setup(sim_config_t *config) {
 
     tag_position = config->c - config->s;
     tag_mask = ~0 & ~(offset_mask | index_mask);
-
-    if (config->vipt) {
-        vipt = true;
-        num_pages = 1 << config->m;
-        num_tlb_entries = 1 << config->t;
-        tlb_translations = initialize_translation_storage(&tlb, num_tlb_entries);
-        hwivpt_translations = initialize_translation_storage(&hwivpt, num_pages);
-        // address masks and positions
+    if (vipt) {
         vpn_mask = ~((1 << config->p) - 1);
         vpn_position = config->p;
+    }
+}
+
+
+
+/**
+ * Subroutine for initializing the cache simulator. You many add and initialize any global or heap
+ * variables as needed.
+ * TODO: You're responsible for completing this routine
+ */
+
+void sim_setup(sim_config_t *config) {
+    configure_user_setup(config);
+    allocate_l1();
+    configure_bit_tools(config);
+    if (config->vipt) {
+        tlb_translations = initialize_translation_storage(&tlb, num_tlb_entries);
+        hwivpt_translations = initialize_translation_storage(&hwivpt, num_pages);
     }
 }
 
